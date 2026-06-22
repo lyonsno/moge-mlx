@@ -1,63 +1,122 @@
 # moge-mlx
 
-MLX-native [MoGe-2](https://github.com/microsoft/MoGe) monocular geometry estimation for Apple Silicon.
+MLX-native [MoGe-2](https://github.com/microsoft/MoGe) model components for Apple Silicon.
 
-Estimates camera intrinsics, depth, normals, and 3D point maps from a single image. No PyTorch, no CUDA — pure MLX on Metal.
+This repo contains the recovered pure-MLX MoGe-2 port that was originally built inside [`pixal3d-mlx`](https://github.com/lyonsno/pixal3d-mlx): a DINOv2-L/14 backbone, ConvStack neck, points head, mask head, metric scale head, weight loader, and focal/shift recovery path.
 
-**Status: Early development.** Camera intrinsics estimation works via subprocess bridge to PyTorch/MPS. MLX-native model port in progress.
+It is no longer a README-only placeholder.
 
-## What is MoGe?
+## What Works
 
-[MoGe](https://github.com/microsoft/MoGe) (Monocular Geometry Estimation) is a ViT-based model from Microsoft Research that estimates 3D geometry from a single image:
+- `MoGeModel`: 326M parameter MLX model matching the MoGe-2 ViT-L architecture.
+- `load_moge_weights`: loads the upstream Hugging Face checkpoint into MLX tensors.
+- `model.infer(...)`: image tensor to point map, depth, intrinsics, and mask.
+- `estimate_camera_params_mlx(...)`: image file to FOV/distance camera parameters.
+- Reference PyTorch/MPS camera path remains available as `estimate_camera_params(...)` for comparison.
 
-- **Camera intrinsics** (focal length / FOV) — used by [pixal3d-mlx](https://github.com/lyonsno/pixal3d-mlx) for projection-aligned 3D conditioning
-- **Depth maps** — metric depth per pixel
-- **Surface normals** — per-pixel 3D orientation
-- **3D point maps** — full xyz point cloud
-- **Object masks** — foreground segmentation
+This surface is focused on depth/points/mask/intrinsics. Do not read this README as a claim that a normal-map head is wired in this standalone package.
 
-The model is a DINOv2 ViT-L backbone with ConvStack heads for each output modality.
+## Install
 
-## Why MLX?
-
-The upstream MoGe requires PyTorch + CUDA. A [Perceptasia sidecar](https://github.com/lyonsno/perceptasia) runs it on PyTorch/MPS, and [pixal3d-mlx](https://github.com/lyonsno/pixal3d-mlx) calls it via subprocess for camera estimation. But this adds a PyTorch dependency to an otherwise pure-MLX pipeline.
-
-An MLX-native port would:
-- Eliminate the PyTorch dependency entirely
-- Share the DINOv2 backbone with DINOv3 (already ported in pixal3d-mlx/trellis2mlx)
-- Enable tighter integration with MLX 3D generation pipelines
-- Run on Apple Silicon without any CUDA or MPS dependency
-
-## Architecture (upstream)
-
-```
-MoGe-2 ViT-L (~300M params)
-├── DINOv2 ViT-L backbone (patch embed + 24 transformer layers + RoPE)
-├── ConvStack neck
-├── ConvStack points_head → 3D point map
-├── ConvStack mask_head → foreground mask
-├── ConvStack normal_head → surface normals
-├── MLP scale_head → metric scale
-└── Geometry recovery (focal length + shift from point map)
+```bash
+git clone https://github.com/lyonsno/moge-mlx.git
+cd moge-mlx
+uv venv .venv --python python3.12
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 ```
 
-## Roadmap
+Download the upstream MoGe-2 ViT-L checkpoint:
 
-- [x] Subprocess bridge for camera intrinsics (landed in pixal3d-mlx)
-- [ ] DINOv2 ViT-L backbone in MLX (reuse DINOv3 port pattern)
-- [ ] ConvStack heads in MLX
-- [ ] Geometry recovery (focal/shift from point map)
-- [ ] Weight conversion (model.pt → safetensors)
-- [ ] End-to-end inference: image → intrinsics + depth + normals
-- [ ] Integration with pixal3d-mlx (replace subprocess bridge)
+```bash
+hf download Ruicheng/moge-2-vitl
+```
+
+The loader also accepts an explicit checkpoint/cache path:
+
+```python
+from moge_mlx import MoGeModel, load_moge_weights
+
+model = MoGeModel()
+load_moge_weights(model, "/path/to/Ruicheng/moge-2-vitl")
+```
+
+## Usage
+
+```python
+from pathlib import Path
+
+from moge_mlx.camera import estimate_camera_params_mlx
+
+params = estimate_camera_params_mlx(Path("image.png"))
+print(params["camera_angle_x"], params["distance"])
+```
+
+Lower-level model API:
+
+```python
+import mlx.core as mx
+import numpy as np
+from PIL import Image
+
+from moge_mlx import MoGeModel, load_moge_weights
+
+image = Image.open("image.png").convert("RGB")
+image_np = np.array(image).astype(np.float32) / 255.0
+image_chw = mx.array(image_np.transpose(2, 0, 1))
+
+model = MoGeModel()
+load_moge_weights(model)
+result = model.infer(image_chw)
+mx.eval(result["depth"], result["intrinsics"])
+```
+
+## Evidence And Boundaries
+
+The port was recovered from the `pixal3d-mlx` MoGe camera-estimation branch after the standalone repo had drifted as a placeholder. The recovered branch recorded MLX/PyTorch parity work for camera estimation and point-map post-processing; see [`docs/moge-camera-estimation.md`](docs/moge-camera-estimation.md).
+
+Current boundaries:
+
+- This is a source recovery and standalone packaging pass, not a new public benchmark claim.
+- The reference normal-map evidence used to debug the WebGPU lane comes from official/local PyTorch MoGe, not this standalone MLX package.
+- Upstream model weights remain governed by their own license and access terms.
+
+## Architecture
+
+```text
+moge_mlx/
+├── model.py      # DINOv2-L backbone, ConvStack heads, inference post-processing
+├── weights.py    # PyTorch/safetensors checkpoint loader and key remapping
+└── camera.py     # camera FOV/distance helpers and MLX/reference routes
+```
+
+Model outline:
+
+- DINOv2-L/14 backbone: 24 transformer blocks, 1024 dim, 16 heads
+- Intermediate feature extraction at layers 5/11/17/23
+- 4 output projections summed into the encoder feature map
+- ConvStack neck with 5 levels and ConvTranspose/Bilinear resamplers
+- Points head, mask head, metric scale head
+- Focal/shift recovery through `scipy.optimize.least_squares`
+
+## Tests
+
+Fast checks:
+
+```bash
+python -m py_compile moge_mlx/*.py tests/*.py
+python -m pytest tests/test_camera.py::TestComputeDistanceFromFov tests/test_model.py::TestMoGeMLXComponentSmoke::test_bilinear_resize
+```
+
+Weight-loading and forward tests require the MoGe checkpoint in the Hugging Face cache and enough unified memory for the 326M parameter model.
 
 ## Credits
 
-- [MoGe](https://github.com/microsoft/MoGe) by Microsoft Research — the model
-- [DINOv2](https://github.com/facebookresearch/dinov2) by Meta — the backbone
-- [pixal3d-mlx](https://github.com/lyonsno/pixal3d-mlx) — consumer of camera intrinsics
-- [MLX](https://github.com/ml-explore/mlx) by Apple — the framework
+- [MoGe](https://github.com/microsoft/MoGe) by Microsoft Research
+- [DINOv2](https://github.com/facebookresearch/dinov2) by Meta
+- [MLX](https://github.com/ml-explore/mlx) by Apple
+- [`pixal3d-mlx`](https://github.com/lyonsno/pixal3d-mlx), where this MLX MoGe port was first integrated
 
 ## License
 
-MIT (porting code). Upstream model weights are subject to their own licenses.
+MIT for the porting code in this repository. Upstream model weights are subject to their own licenses.
