@@ -128,6 +128,9 @@ class DINOv2Backbone(nn.Module):
         num_patches = h * w
         num_pos = self.pos_embed.shape[1] - 1  # exclude CLS
 
+        # Both conditions required: num_patches == num_pos ensures token count
+        # matches, h == w ensures the aspect ratio matches the square training
+        # grid. A non-square h*w could equal num_pos while needing reshape.
         if num_patches == num_pos and h == w:
             return self.pos_embed
 
@@ -643,6 +646,12 @@ class MoGeModel(nn.Module):
         img_h, img_w = image.shape[1], image.shape[2]
         aspect_ratio = img_w / img_h
 
+        if num_tokens > 10000:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds maximum 10000. "
+                f"Use infer() which bounds resolution_level to [0, 9] (max 3600 tokens)."
+            )
+
         # Compute token grid
         base_h = round((num_tokens / aspect_ratio) ** 0.5)
         base_w = round((num_tokens * aspect_ratio) ** 0.5)
@@ -709,6 +718,9 @@ class MoGeModel(nn.Module):
         }
         if normal_out is not None:
             # L2-normalize normals to unit vectors
+            # eps=1e-8 (not PyTorch's default 1e-12) — 1e-12 can vanish in fp32
+            # addition when sum is normal-sized. Neural network normals are never
+            # near-zero magnitude, so this is purely defensive.
             normal_norm = mx.sqrt(mx.sum(normal_out ** 2, axis=-1, keepdims=True) + 1e-8)
             result["normal"] = normal_out / normal_norm
         return result
@@ -820,13 +832,18 @@ def _pil_resize(x: mx.array, target_h: int, target_w: int) -> mx.array:
 
 def _bicubic_resize(x: mx.array, target_h: int, target_w: int,
                      scale_factor: Tuple[float, float] = None) -> mx.array:
-    """Bicubic resize for [B, H, W, C] tensor (align_corners=False).
+    """Bicubic interpolation matching PyTorch F.interpolate(mode='bicubic', align_corners=False).
 
-    Matches PyTorch's F.interpolate(mode='bicubic', align_corners=False).
+    Designed for small grids (e.g., position embeddings). Uses Python-level
+    iteration over a 4x4 kernel — not suitable for large tensors.
+
     When scale_factor is given, output coordinates are derived from the scale
     factor (matching PyTorch's behaviour when both size and scale_factor are
     effectively determined by scale_factor).
     """
+    # Only early-return when scale_factor is None. When scale_factor is
+    # provided, coordinate mapping differs even if dimensions match (DINOv2
+    # +0.1 offset trick), so we must run the full interpolation.
     if x.shape[1] == target_h and x.shape[2] == target_w and scale_factor is None:
         return x
 

@@ -139,6 +139,18 @@ class TestMoGeMLXComponentSmoke:
         mx.eval(z)
         np.testing.assert_allclose(np.array(x), np.array(z), atol=1e-6)
 
+    def test_bicubic_resize_basic(self):
+        """_bicubic_resize produces correct shape and differs from bilinear."""
+        from moge_mlx.model import _bicubic_resize, _bilinear_resize
+        x = mx.array(np.random.rand(1, 8, 8, 4).astype(np.float32))
+        out = _bicubic_resize(x, 16, 16)
+        mx.eval(out)
+        assert out.shape == (1, 16, 16, 4)
+        # Bicubic should differ from bilinear
+        out_bilinear = _bilinear_resize(x, 16, 16)
+        mx.eval(out_bilinear)
+        assert not np.allclose(np.array(out), np.array(out_bilinear), atol=1e-6)
+
     def test_missing_weights_error(self):
         """Verify helpful error when weights are not found."""
         from moge_mlx.weights import _find_hf_weights
