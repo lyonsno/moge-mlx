@@ -293,10 +293,7 @@ class DINOv2Encoder(nn.Module):
             cls_token: [B, D]
         """
         # Resize image to match token grid before normalization.
-        # Use PIL LANCZOS for the initial resize — it closely matches
-        # PyTorch's F.interpolate(antialias=True) which the model was trained
-        # with. MLX's bilinear lacks antialiasing and produces measurably
-        # different results that compound through the 24 transformer blocks.
+        # Match the antialiased bilinear input resize used by upstream DINOv2.
         target_h = token_h * self.backbone.patch_size
         target_w = token_w * self.backbone.patch_size
         if image.shape[1] != target_h or image.shape[2] != target_w:
@@ -821,13 +818,32 @@ class MoGeModel(nn.Module):
 # ============================================================================
 
 def _pil_resize(x: mx.array, target_h: int, target_w: int) -> mx.array:
-    """Resize using align_corners=False bilinear.
+    """MLX bilinear resize with antialiasing and half-pixel coordinates.
 
-    For the encoder input resize, we now use _bilinear_resize which
-    implements align_corners=False matching upstream F.interpolate.
-    This wrapper exists for API compatibility.
+    The historical name is retained for compatibility. Only the encoder input
+    uses this filter; decoder interpolation remains non-antialiased upstream.
     """
-    return _bilinear_resize(x, target_h, target_w)
+    # Separable triangle filter, widened on downscale. Match upstream's
+    # horizontal-then-vertical order and renormalize truncated border taps.
+    for axis, target in ((2, target_w), (1, target_h)):
+        size = x.shape[axis]
+        if size == target:
+            continue
+        scale = size / target
+        support = max(scale, 1.0)
+        center = (mx.arange(target, dtype=mx.float32) + 0.5) * scale
+        start = mx.floor(center - support + 0.5)
+        offsets = mx.arange(2 * math.ceil(support) + 1)
+        indices = start[:, None] + offsets[None, :]
+        weights = mx.maximum(1 - mx.abs(indices + 0.5 - center[:, None]) / support, 0)
+        weights = mx.where((indices >= 0) & (indices < size), weights, 0)
+        weights = weights / mx.sum(weights, axis=1, keepdims=True)
+        indices = mx.clip(indices, 0, size - 1).astype(mx.int32)
+        samples = mx.take(x, indices, axis=axis)
+        shape = [1] * samples.ndim
+        shape[axis], shape[axis + 1] = target, offsets.size
+        x = mx.sum(samples * weights.reshape(shape), axis=axis + 1)
+    return x
 
 
 def _bicubic_resize(x: mx.array, target_h: int, target_w: int,
