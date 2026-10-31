@@ -953,9 +953,10 @@ def _recover_focal_shift_np(
     points_np = np.array(points[0])  # [H, W, 3]
     mask_np = np.array(mask[0])  # [H, W]
 
-    # Simple nearest downsample
-    h_idx = np.linspace(0, img_h - 1, ds, dtype=int)
-    w_idx = np.linspace(0, img_w - 1, ds, dtype=int)
+    # Match upstream F.interpolate(mode="nearest") on points, mask and UVs.
+    # Every sampled point must keep the coordinate of its original pixel.
+    h_idx = np.floor(np.arange(ds) * img_h / ds).astype(int)
+    w_idx = np.floor(np.arange(ds) * img_w / ds).astype(int)
     points_ds = points_np[np.ix_(h_idx, w_idx)]
     mask_ds = mask_np[np.ix_(h_idx, w_idx)]
 
@@ -963,8 +964,8 @@ def _recover_focal_shift_np(
     diag = math.sqrt(1 + aspect_ratio ** 2)
     span_u = aspect_ratio / diag
     span_v = 1.0 / diag
-    u = np.linspace(-span_u * (ds - 1) / ds, span_u * (ds - 1) / ds, ds)
-    v = np.linspace(-span_v * (ds - 1) / ds, span_v * (ds - 1) / ds, ds)
+    u = ((w_idx + 0.5) / img_w * 2 - 1) * span_u
+    v = ((h_idx + 0.5) / img_h * 2 - 1) * span_v
     gu, gv = np.meshgrid(u, v)
     uv = np.stack([gu, gv], axis=-1)
 
